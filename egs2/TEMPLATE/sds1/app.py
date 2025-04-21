@@ -1,8 +1,11 @@
 import argparse
 import os
+os.environ['TORCH_HOME'] = '/data/user_data/tidris/huggingface_cache'
+os.environ['HF_HOME'] = '/data/user_data/tidris/huggingface_cache'
 import shutil
 import time
 from typing import Generator, Optional, Tuple
+
 
 import gradio as gr
 import nltk
@@ -33,10 +36,73 @@ from pyscripts.utils.dialog_eval.TTS_speech_quality import TTS_psuedomos
 
 from espnet2.sds.espnet_model import ESPnetSDSModelInterface
 
+import json, torch, torch.nn as nn, numpy as np
+from transformers import WhisperFeatureExtractor, WhisperModel
+
+# ---- Load your finetuned LID head ----
+lid_cfg = json.load(open("./local/config.json"))
+LANGUAGES = lid_cfg["languages"]    # e.g. ["en","fr","es","hi"]
+THRESH     = lid_cfg["threshold"]
+
+fe  = WhisperFeatureExtractor.from_pretrained("openai/whisper-tiny")
+enc = WhisperModel.from_pretrained("openai/whisper-tiny").encoder.to("cpu")  # or device
+enc.eval()
+
+class LIDHead(nn.Module):
+    def __init__(self, hidden_size=384, num_classes=len(LANGUAGES),
+                 n_heads=4, dropout=0.3):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=hidden_size,
+                                          num_heads=n_heads,
+                                          dropout=dropout,
+                                          batch_first=True)
+        self.dropout    = nn.Dropout(dropout)
+        self.pool       = lambda x: torch.cat([x.mean(1), x.std(1)], 1)
+        self.classifier = nn.Linear(hidden_size*2, num_classes)
+    def forward(self, x):
+        x = self.dropout(x)
+        out, _ = self.attn(x, x, x)
+        rep    = self.pool(out)
+        return self.classifier(self.dropout(rep))
+
+# lid_head = LIDHead().to("cpu")  # or your device
+# We know the checkpoint has 4 outputs:
+lid_head = LIDHead(num_classes=4).to("cpu")
+state    = torch.load("./local/checkpoint.pt", map_location="cpu")
+lid_head.load_state_dict(state["lid_head"])
+lid_head.eval()
+
+def run_lid(wav: np.ndarray):
+    feats = fe(wav, sampling_rate=16000, return_tensors="pt").input_features
+    with torch.no_grad():
+        h     = enc(feats).last_hidden_state       # (1, T, D)
+        logits= lid_head(h)                        # (1, C)
+        probs = torch.softmax(logits, -1)[0].cpu().numpy()
+    idx = int(probs.argmax().item())
+    conf = float(probs[idx])
+    if idx < len(LANGUAGES):
+        lang = LANGUAGES[idx]
+    else:
+        # anything in that “4th” slot → fallback
+        lang = "multi"
+    return lang, conf
+
+
+# adjust these keys to exactly match the ASR names you passed via --asr_options
+LID2ASR = {
+    "en":   "espnet/owsm_ctc_v3.2_ft_1B",  # use the ESPnet English model
+    "fr":   "whisper-large",             # fallback to the multilingual Whisper
+    "es":   "whisper-large",             # likewise for Spanish
+    "multi":"whisper-large"              # low‑confidence fallback
+}
+
+
+
 # ------------------------
 # Hyperparameters
 # ------------------------
 
+os.environ['HF_TOKEN'] = "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"
 access_token = os.environ.get("HF_TOKEN")
 ASR_name = None
 LLM_name = None
@@ -352,36 +418,86 @@ def start_warmup():
     global ASR_name
     global LLM_name
     global TTS_name
-    for opt_count in range(len(ASR_options)):
-        opt = ASR_options[opt_count]
+    # for opt_count in range(len(ASR_options)):
+    #     opt = ASR_options[opt_count]
+    #     try:
+    #         for _ in dialogue_model.handle_ASR_selection(opt):
+    #             continue
+    #     except Exception:
+    #         print("Removing " + opt + " from ASR options since it cannot be loaded.")
+    #         ASR_options = ASR_options[:opt_count] + ASR_options[(opt_count + 1) :]
+    #         if opt == ASR_name:
+    #             ASR_name = ASR_options[0]
+    valid_asr = []
+    print("=== Loading ASR options (with error output) ===")
+    for opt in ASR_options:
         try:
+            # warm up this ASR model
             for _ in dialogue_model.handle_ASR_selection(opt):
-                continue
-        except Exception:
-            print("Removing " + opt + " from ASR options since it cannot be loaded.")
-            ASR_options = ASR_options[:opt_count] + ASR_options[(opt_count + 1) :]
-            if opt == ASR_name:
-                ASR_name = ASR_options[0]
-    for opt_count in range(len(LLM_options)):
-        opt = LLM_options[opt_count]
+                pass
+            valid_asr.append(opt)
+        except Exception as e:
+            print(f"\n*** ERROR loading ASR option '{opt}':")
+            import traceback; traceback.print_exc()
+            print(f"*** Excluding '{opt}' from ASR dropdown.\n")
+    ASR_options = valid_asr
+    # if the default was removed, pick the first valid one
+    if ASR_options and ASR_name not in ASR_options:
+        ASR_name = ASR_options[0]
+    # for opt_count in range(len(LLM_options)):
+    #     opt = LLM_options[opt_count]
+    #     try:
+    #         for _ in dialogue_model.handle_LLM_selection(opt):
+    #             continue
+    #     except Exception:
+    #         print("Removing " + opt + " from LLM options since it cannot be loaded.")
+    #         LLM_options = LLM_options[:opt_count] + LLM_options[(opt_count + 1) :]
+    #         if opt == LLM_name:
+    #             LLM_name = LLM_options[0]
+
+        # ——— Clean up LLM options but print full errors ———
+    valid_llm = []
+    print("=== Loading LLM options (with error output) ===")
+    for opt in LLM_options:
         try:
+            # warm up this LLM model
             for _ in dialogue_model.handle_LLM_selection(opt):
-                continue
-        except Exception:
-            print("Removing " + opt + " from LLM options since it cannot be loaded.")
-            LLM_options = LLM_options[:opt_count] + LLM_options[(opt_count + 1) :]
-            if opt == LLM_name:
-                LLM_name = LLM_options[0]
-    for opt_count in range(len(TTS_options)):
-        opt = TTS_options[opt_count]
+                pass
+            valid_llm.append(opt)
+        except Exception as e:
+            print(f"\n*** ERROR loading LLM option '{opt}':")
+            import traceback; traceback.print_exc()
+            print(f"*** Excluding '{opt}' from LLM dropdown.\n")
+    LLM_options = valid_llm
+    if LLM_options and LLM_name not in LLM_options:
+        LLM_name = LLM_options[0]
+
+
+
+    # for opt_count in range(len(TTS_options)):
+    #     opt = TTS_options[opt_count]
+    #     try:
+    #         for _ in dialogue_model.handle_TTS_selection(opt):
+    #             continue
+    #     except Exception:
+    #         print("Removing " + opt + " from TTS options since it cannot be loaded.")
+    #         TTS_options = TTS_options[:opt_count] + TTS_options[(opt_count + 1) :]
+    #         if opt == TTS_name:
+    #             TTS_name = TTS_options[0]
+
+    valid_tts = []
+    print("=== Loading TTS options (with error output) ===")
+    for opt in TTS_options:
         try:
             for _ in dialogue_model.handle_TTS_selection(opt):
-                continue
+                pass
+            valid_tts.append(opt)
         except Exception:
-            print("Removing " + opt + " from TTS options since it cannot be loaded.")
-            TTS_options = TTS_options[:opt_count] + TTS_options[(opt_count + 1) :]
-            if opt == TTS_name:
-                TTS_name = TTS_options[0]
+            print(f"*** ERROR loading TTS option '{opt}'. Excluding from dropdown.")
+    TTS_options = valid_tts
+    if TTS_options and TTS_name not in TTS_options:
+        TTS_name = TTS_options[0]
+
     dialogue_model.handle_E2E_selection()
     dialogue_model.client = None
     for _ in dialogue_model.handle_TTS_selection(TTS_name):
@@ -497,6 +613,17 @@ def transcribe(
         audio_output1 = None
     else:
         stream = np.concatenate((stream, y))
+        
+    pred_lang, conf = run_lid(y)
+    if conf < THRESH:
+        pred_lang = "multi"
+    asr_key = LID2ASR[pred_lang]
+
+    # tell the SDS interface to switch to our chosen ASR—but don't unpack any outputs
+    for _ in dialogue_model.handle_ASR_selection(asr_key):
+        pass
+
+    print(f"[LID] → {pred_lang} (conf={conf:.2f}) → ASR = {asr_key}")
     (
         asr_output_str,
         text_str,
