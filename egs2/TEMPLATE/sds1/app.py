@@ -102,7 +102,7 @@ LID2ASR = {
 # Hyperparameters
 # ------------------------
 
-# os.environ['HF_TOKEN'] = "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"
+os.environ['HF_TOKEN'] = "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"
 access_token = os.environ.get("HF_TOKEN")
 ASR_name = None
 LLM_name = None
